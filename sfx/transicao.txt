@@ -1,0 +1,3 @@
+ElevenLabs Sound Effects
+prompt: Fast cinematic whoosh transition swoosh with a bright camera flash shimmer and a soft punchy impact at the end, clean, modern social media video transition, no music, no voice
+duracao: 1.2

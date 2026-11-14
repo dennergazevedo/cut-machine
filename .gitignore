@@ -1,0 +1,5 @@
+.env
+.venv/
+entrada/*
+saida/*
+trabalho/*

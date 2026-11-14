@@ -1,0 +1,4 @@
+#!/bin/bash
+# Máquina de Cortes – atalho.  Ex.: ./corte info entrada/video.mp4
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/.venv/bin/python" "$DIR/maquina/cortes.py" "$@"
