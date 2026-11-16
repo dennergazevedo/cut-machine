@@ -1,6 +1,8 @@
 """Renderização dos cortes: recorte 9:16 + legendas/título + áudio normalizado."""
+import json
 import subprocess
 import time
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
@@ -287,11 +289,42 @@ class Corte:
         return quadro
 
 
+_FPS_PADRAO = [Fraction(24000, 1001), Fraction(24), Fraction(25), Fraction(30000, 1001), Fraction(30),
+               Fraction(50), Fraction(60000, 1001), Fraction(60)]
+
+
 def _fps_saida(info):
+    """fps de saída como fração padrão (29.97 -> 30000/1001); fontes VFR (média 29.87...) são encaixadas."""
     f = info["fps"]
-    if f <= 0 or f > C.FPS_MAX:
-        return 30.0
-    return round(f * 1000) / 1000
+    if f <= 0 or f > C.FPS_MAX + 0.5:
+        return Fraction(30)
+    p = min(_FPS_PADRAO, key=lambda x: abs(float(x) - f))
+    return p if abs(float(p) - f) < 0.6 else Fraction(round(f * 1000), 1000)
+
+
+_AFMT = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+
+
+def _loudnorm(entradas, filtro):
+    """1ª passada: mede o loudness do áudio montado por `filtro` (saída [m]) e devolve um ganho FIXO até
+    LOUDNESS_ALVO. O loudnorm de passada única (modo dinâmico) ajusta o ganho aos poucos e 'bombeia' o volume
+    nos primeiros segundos – justamente o gancho. Picos acima do teto ficam a cargo do LIMITADOR final."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-f", "lavfi", "-t", "0.1", "-i", "anullsrc", *entradas,
+           "-filter_complex", f"{filtro};[m]{C.LOUDNORM}:print_format=json", "-f", "null", "-"]
+    err = subprocess.run(cmd, capture_output=True, text=True).stderr
+    try:
+        j = json.loads(err[err.rindex("{"):err.rindex("}") + 1])
+        li, tp = float(j["input_i"]), float(j["input_tp"])
+        if not (-70 < li < 10):
+            raise ValueError
+    except (ValueError, KeyError):
+        print("  AVISO: medição de loudness falhou; usando loudnorm de passada única")
+        return C.LOUDNORM
+    ganho = C.LOUDNESS_ALVO - li
+    print(f"  loudness: {li:.1f} LUFS (pico {tp:.1f} dBTP) -> ganho fixo {ganho:+.1f} dB")
+    if tp + ganho > 6:
+        print(f"  AVISO: picos {tp + ganho:.0f} dB acima de 0 dBFS serão segurados pelo limitador (áudio original muito dinâmico)")
+    return f"volume={ganho:.2f}dB"
 
 
 def _flash(quadro, intensidade):
@@ -346,44 +379,59 @@ def renderizar_corte(plano_geral, c, rapido=False, preview=False, forcar=False):
 
     enc_cmd = ["ffmpeg", "-y", "-v", "error",
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{C.LARGURA}x{C.ALTURA}", "-r", str(fps), "-i", "-"]
+    # Áudio: tudo convertido para 48 kHz estéreo float -> loudnorm em 2 passadas (ganho linear) -> SFX ->
+    # limitador final (a soma voz + SFX nunca passa de ~-1 dBFS; antes o SFX era somado DEPOIS do loudnorm
+    # e podia estourar 0 dBFS na emenda, distorcendo no re-encode do YouTube).
+    entradas, voz, sfx = [], None, None   # entradas de áudio: índices a partir de 1 (0 = vídeo pelo pipe)
+    fb = C.AUDIO_FADE_BORDA
     if corte.copyright:
         if corte.musica is None:
             raise SystemExit(f"copyright_audio ativo mas nenhuma trilha em {C.SOUND}")
         fo = max(0.0, total - C.MUSICA_FADE_OUT)
         print(f"  áudio com copyright -> trilha: {corte.musica.name}")
-        enc_cmd += ["-stream_loop", "-1", "-ss", f"{corte.musica_inicio:.3f}", "-i", str(corte.musica),
-                    "-map", "0:v", "-map", "1:a", "-t", f"{total:.3f}",
-                    "-af", f"afade=t=in:d={C.MUSICA_FADE_IN},afade=t=out:st={fo:.3f}:d={C.MUSICA_FADE_OUT},{C.LOUDNORM}"]
+        entradas = ["-stream_loop", "-1", "-ss", f"{corte.musica_inicio:.3f}", "-t", f"{total:.3f}", "-i", str(corte.musica)]
+        voz = f"[1:a]{_AFMT},afade=t=in:d={C.MUSICA_FADE_IN},afade=t=out:st={fo:.3f}:d={C.MUSICA_FADE_OUT}[m]"
     elif info["tem_audio"]:
         for p in partes:
-            enc_cmd += ["-ss", f"{p.inicio:.3f}", "-t", f"{p.dur:.3f}", "-i", str(video)]
+            entradas += ["-ss", f"{p.inicio:.3f}", "-t", f"{p.dur:.3f}", "-i", str(video)]
+        fim_corte = f"afade=t=out:st={max(0.0, corte.dur - fb):.3f}:d={fb}"
         if gancho:
             ta = C.TRANSICAO_AUDIO
-            filtro = (f"[1:a]afade=t=out:st={gancho.dur - ta:.3f}:d={ta}[a1];[2:a]afade=t=in:d={ta}[a2];"
-                      f"[a1][a2]concat=n=2:v=0:a=1,{C.LOUDNORM}[voz]")
+            voz = (f"[1:a]{_AFMT},afade=t=in:d={fb},afade=t=out:st={gancho.dur - ta:.3f}:d={ta}[a1];"
+                   f"[2:a]{_AFMT},afade=t=in:d={ta},{fim_corte}[a2];[a1][a2]concat=n=2:v=0:a=1[m]")
             sfx = sfx_transicao()
             if sfx:
-                atraso = int(max(0.0, gancho.dur - C.SFX_ANTECIPA) * 1000)
-                enc_cmd += ["-i", str(sfx)]
-                filtro += (f";[3:a]aformat=sample_rates=48000:channel_layouts=stereo,volume={C.SFX_VOLUME},"
-                           f"adelay={atraso}|{atraso}[fx];[voz]aformat=sample_rates=48000:channel_layouts=stereo[v2];"
-                           f"[v2][fx]amix=inputs=2:duration=first:normalize=0[a]")
                 print(f"  som de transição: {sfx.name}")
             else:
-                filtro = filtro.replace("[voz]", "[a]")
                 print(f"  (sem som de transição: coloque sfx/{C.SFX_TRANSICAO}.mp3 ou rode ./corte sfx)")
-            enc_cmd += ["-filter_complex", filtro, "-map", "0:v", "-map", "[a]"]
         else:
-            enc_cmd += ["-map", "0:v", "-map", "1:a", "-af", C.LOUDNORM]
-    if corte.copyright or info["tem_audio"]:
-        enc_cmd += ["-c:a", "aac", "-b:a", C.AUDIO_BITRATE, "-ar", "48000"]
-    enc_cmd += ["-c:v", "libx264", "-preset", "veryfast" if rapido else C.PRESET, "-crf", str(C.CRF + (5 if rapido else 0)),
-                "-pix_fmt", "yuv420p", "-profile:v", "high", "-movflags", "+faststart", "-shortest", str(destino)]
+            voz = f"[1:a]{_AFMT},afade=t=in:d={fb},{fim_corte}[m]"
+    if voz:
+        filtro = f"{voz};[m]{_loudnorm(entradas, voz)},aresample=48000,{_AFMT}[n]"
+        saida_a = "[n]"
+        if sfx:
+            k = len(partes) + 1
+            atraso = int(max(0.0, gancho.dur - C.SFX_ANTECIPA) * 1000)
+            entradas += ["-i", str(sfx)]
+            filtro += (f";[{k}:a]{_AFMT},volume={C.SFX_VOLUME},adelay={atraso}|{atraso}[fx];"
+                       f"[n][fx]amix=inputs=2:duration=first:normalize=0[nx]")
+            saida_a = "[nx]"
+        filtro += f";{saida_a}{C.LIMITADOR},{_AFMT}[a]"
+        enc_cmd += entradas + ["-filter_complex", filtro, "-map", "0:v", "-map", "[a]",
+                               "-c:a", "aac", "-b:a", C.AUDIO_BITRATE, "-ar", "48000", "-ac", "2"]
+    cor = C.COR_SAIDA
+    enc_cmd += ["-vf", f"scale=out_color_matrix={cor}:out_range=tv,format=yuv420p,"
+                f"setparams=colorspace={cor}:color_primaries={cor}:color_trc={cor}:range=tv",
+                "-c:v", "libx264", "-preset", "veryfast" if rapido else C.PRESET, "-crf", str(C.CRF + (5 if rapido else 0)),
+                "-pix_fmt", "yuv420p", "-profile:v", "high",
+                "-colorspace", cor, "-color_primaries", cor, "-color_trc", cor, "-color_range", "tv",
+                "-movflags", "+faststart", "-shortest", str(destino)]
     enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE)
     tam = W * H * 3
     t0 = time.time()
     feitos = 0
     n_total = int(total * fps)
+    fps_f = float(fps)
     for parte in partes:
         eh_gancho = parte is gancho
         dec = subprocess.Popen(["ffmpeg", "-v", "error", "-ss", f"{parte.inicio:.3f}", "-i", str(video),
@@ -395,7 +443,7 @@ def renderizar_corte(plano_geral, c, rapido=False, preview=False, forcar=False):
             if len(buf) < tam:
                 break
             frame = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
-            t_rel = k / fps
+            t_rel = k / fps_f
             plano, cx, cy, ch = E.crop_em(parte.planos, parte.inicio + t_rel)
             quadro = compor(frame, plano, cx, cy, ch, parte.ajustar_yc)
             parte.sobrepor(quadro, t_rel, preview, gancho=eh_gancho)
@@ -406,7 +454,7 @@ def renderizar_corte(plano_geral, c, rapido=False, preview=False, forcar=False):
             enc.stdin.write(quadro.tobytes())
             k += 1
             feitos += 1
-            if feitos % int(fps * 10) == 0:
+            if feitos % int(fps_f * 10) == 0:
                 print(f"    {feitos}/{n_total} quadros ({feitos / (time.time() - t0):.0f} fps)", flush=True)
         dec.wait()
     enc.stdin.close()

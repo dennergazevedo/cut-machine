@@ -22,7 +22,11 @@ FPS_MAX = 60
 CRF = 18
 PRESET = "medium"
 AUDIO_BITRATE = "192k"
-LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"  # padrão de loudness das redes
+LOUDNESS_ALVO = -14.0               # LUFS (padrão das redes). Medido na 1ª passada e aplicado como ganho fixo
+LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"  # usado só para medir (e como reserva se a medição falhar)
+LIMITADOR = "alimiter=limit=0.84:attack=5:release=50:level=false:latency=true"  # teto ~-1,5 dBFS após a mixagem (SFX)
+AUDIO_FADE_BORDA = 0.02              # s de fade no 1º/último instante do áudio (evita estalo no corte seco)
+COR_SAIDA = "bt709"                  # matriz/primárias/transferência marcadas no H.264 (padrão HD do YouTube)
 
 # ---------------------------------------------------------------------------
 # Safe area combinada (TikTok + Instagram Reels + YouTube Shorts) em 1080x1920
