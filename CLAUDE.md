@@ -195,7 +195,13 @@ Escolha: jogo com ação concentrada → `movimento`; jogo com HUD/minimapa impo
 `ajustar`; vídeo editado com box → `centro` com `x/zoom` no box (descubra a posição pela `folha`) ou `ajustar`.
 
 ## Saída
-H.264 (CRF 18) 1080x1920, fps da fonte (máx. 60), AAC 192k com loudness normalizado (-14 LUFS).
+H.264 (CRF 18) 1080x1920, cor marcada **BT.709** (matriz/primárias/transferência, faixa tv), fps da fonte encaixado
+numa taxa padrão (29,97 → 30000/1001; máx. 60). Áudio AAC 192k, 48 kHz estéreo, -14 LUFS, compatível com YouTube:
+- loudness em **2 passadas**: mede o áudio montado (gancho + corte ou trilha) e aplica **ganho fixo** (`LOUDNESS_ALVO`).
+  Não usar loudnorm de passada única: o modo dinâmico "bombeia" o volume nos primeiros segundos (o gancho);
+- SFX da transição somado **depois** do ganho e **limitador final** (`LIMITADOR`, ~-1,5 dBFS) para a soma voz + SFX
+  nunca estourar 0 dBFS (o re-encode do YouTube transforma isso em distorção);
+- micro fade (`AUDIO_FADE_BORDA`) no primeiro e no último instante para não estalar no corte seco.
 Arquivos: `saida/<video>/NN_nome.mp4` + `saida/<video>/SEO.md`.
 
 ## Desempenho (M1 Pro)
